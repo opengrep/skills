@@ -263,6 +263,80 @@ rules:
 - **Sinks**: Where data becomes dangerous
 - **Sanitizers**: What makes data safe
 
+### YAML Pitfalls
+
+Patterns are YAML string values. Any pattern containing `: ` (colon-space) will be misinterpreted as a YAML mapping and cause a validation error. Always quote such patterns:
+
+```yaml
+# BROKEN -- YAML parser sees "shell: true" as a nested mapping
+- pattern: spawn($CMD, { ..., shell: true, ... })
+
+# CORRECT -- quoted string, parsed as a single pattern value
+- pattern: "spawn($CMD, { ..., shell: true, ... })"
+```
+
+Common triggers: `shell: true`, `mode: 0o777`, `redirect: "follow"`, `error: $ERR`. When in doubt, quote the pattern.
+
+For patterns containing both double quotes and colons, use escaped inner quotes:
+
+```yaml
+- pattern: "fetch($URL, { ..., redirect: \"follow\", ... })"
+```
+
+### Scanning Non-Code Files (generic language)
+
+For XML configs, YAML pipelines, Dockerfiles, and other non-code files, structural patterns may not work. Use `languages: [generic]` with `pattern-regex`:
+
+```yaml
+rules:
+  - id: cleartext-traffic
+    patterns:
+      - pattern-regex: 'cleartextTrafficPermitted\s*=\s*"true"'
+    languages: [generic]
+    severity: WARNING
+    paths:
+      include:
+        - "app/src/"
+```
+
+The `paths` key restricts which files a rule applies to:
+
+```yaml
+paths:
+  include:
+    - ".github/workflows/"    # Only scan GHA workflow files
+  exclude:
+    - "test/"                 # Skip test directories
+```
+
+**Note**: `languages: [dockerfile]` exists but `pattern-not-inside` does not work reliably across multiple Dockerfile directives. Prefer `generic` + regex for Dockerfile security checks that span multiple lines.
+
+### metavariable-pattern
+
+Use `metavariable-pattern` to constrain what a metavariable can match. It must be a list item inside `patterns:`, alongside the pattern that captures the metavariable:
+
+```yaml
+rules:
+  - id: dynamic-property-assignment
+    patterns:
+      - pattern: $OBJ[$KEY] = $VALUE
+      - metavariable-pattern:
+          metavariable: $KEY
+          patterns:
+            - pattern-not: "..."    # Exclude literal string keys
+    languages: [typescript, javascript]
+    severity: WARNING
+```
+
+This is distinct from `metavariable-regex` which filters by regex rather than by pattern.
+
+### Pattern Parsing Limitations
+
+Some language constructs cannot be matched as standalone fragments:
+
+- **`catch` blocks**: `catch ($ERR) { ... }` alone is invalid. You must include the `try`: `try { ... } catch ($ERR) { ... }`. Even then, complex ellipsis inside the catch body may fail to parse for TypeScript.
+- **Workaround**: Match the dangerous expression directly instead of wrapping in try/catch context.
+
 ### Rule Options (Opengrep-specific)
 
 ```yaml
@@ -303,8 +377,8 @@ def safe():
 # Test a rule (supports multiple target files)
 opengrep test --config rule.yaml test_file.py test_file2.py
 
-# Validate YAML syntax
-opengrep scan --validate --config rule.yaml
+# Validate rule syntax (positional argument, not --config)
+opengrep validate rule.yaml
 
 # Debug taint flow
 opengrep scan --dataflow-traces -f rule.yaml test_file.py
@@ -350,13 +424,20 @@ opengrep scan --opengrep-ignore-pattern='nosec' -f rule.yaml .
 rules:
   - id: command-injection
     metadata:
-      cwe: "CWE-78: OS Command Injection"
-      owasp: "A03:2021 - Injection"
-      confidence: HIGH
+      category: security
+      subcategory:
+        - vuln              # vuln = confirmed vulnerability, audit = needs review
+      cwe:
+        - "CWE-78: Improper Neutralization of Special Elements used in an OS Command"
+      owasp:
+        - "A03:2021 - Injection"
+      confidence: HIGH      # HIGH, MEDIUM, or LOW
       references:
         - https://owasp.org/Top10/A03_2021-Injection/
     # ... rest of rule
 ```
+
+The `category`/`subcategory`/`confidence` fields are used by tooling to classify and filter findings. Use `subcategory: [vuln]` for high-confidence vulnerabilities and `subcategory: [audit]` for patterns that need manual review.
 
 Use `--inline-metavariables` to include metavariable values in metadata output.
 
