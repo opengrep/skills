@@ -4,7 +4,8 @@ description: >-
   Run Opengrep for pattern-based code search and security scanning.
   Use when grep is insufficient for finding code patterns that require
   structural understanding (function calls, data flow, nested structures).
-  Also use for security vulnerability detection with custom YAML rules.
+  Also use for security vulnerability detection with custom YAML rules,
+  including taint tracking across functions and across files (interfile).
 ---
 
 # Opengrep Static Analysis
@@ -41,21 +42,7 @@ Run rulesets to detect vulnerabilities and insecure patterns.
 
 ## Installation
 
-### Linux / macOS
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/opengrep/opengrep/main/install.sh | bash
-```
-
-### Windows (PowerShell)
-
-```powershell
-irm https://raw.githubusercontent.com/opengrep/opengrep/main/install.ps1 | iex
-```
-
-### Manual Install
-
-Download binaries from the [releases page](https://github.com/opengrep/opengrep/releases).
+Follow the installation instructions in the [Opengrep README](https://github.com/opengrep/opengrep#installation).
 
 ### Verify
 
@@ -116,8 +103,8 @@ opengrep scan --config p/default --json -o results.json .
 # Show data flow traces
 opengrep scan --dataflow-traces -f rule.yaml .
 
-# Include enclosing context (function/class) in JSON output (experimental)
-opengrep scan --output-enclosing-context --json -f rule.yaml . --experimental
+# Include enclosing context (function/class) in JSON output
+opengrep scan --output-enclosing-context --json -f rule.yaml .
 ```
 
 ### Filtering
@@ -141,7 +128,35 @@ Opengrep supports tracking taint across functions within a file:
 opengrep scan --taint-intrafile -f taint-rule.yaml .
 ```
 
-This enables higher-order function support and is similar to Semgrep Pro's `--pro-intrafile`.
+This enables higher-order function support and is similar to Semgrep Pro's `--pro-intrafile`. To enable it for a single rule instead, set `options: { taint_intrafile: true }` in that rule. `--disable-intrafile` disables it for all rules, overriding the rule option.
+
+### Interfile (Cross-File) Tainting
+
+Opengrep tracks taint from a source in one file, through function calls, to a sink in another file. Interfile analysis is applied to a rule only when both conditions hold:
+
+1. The rule sets `options: { taint_interfile: true }` (or the alias `interfile: true`; setting both is an error).
+2. The scan is invoked with `--enable-interfile`.
+
+```bash
+opengrep scan --enable-interfile -f interfile-rules.yaml .
+```
+
+Without `--enable-interfile`, a rule that sets the option is analysed as if the option were absent: no cross-function analysis at all, not even within a file, unless intrafile analysis is enabled separately (`--taint-intrafile` or `taint_intrafile: true`). Opengrep emits a warning listing such rules. Enabling interfile analysis for a rule also enables intrafile cross-function analysis for it.
+
+Supported languages: Apex, C, C++, C#, Clojure, Crystal, Dart, Elixir, Go, Java, JavaScript, Julia, Kotlin, Lua, PHP, Python, Ruby, Rust, Scala, Swift, TypeScript, Visual Basic.
+
+| Flag                               | Purpose                                     |
+|------------------------------------|---------------------------------------------|
+| `--interfile-depth=N`              | Call depth limit (default 3, `-1` for none) |
+| `--interfile-dedup-by=source-sink` | One finding per source and sink pair        |
+| `--interfile-timeout=SECS`         | Time limit per rule (default 0, none)       |
+| `--max-memory=MiB`                 | Memory limit (default 0, none)              |
+
+**Call depth.** A flow is found only if some function calls, directly or through other functions, both the function containing the source and the function containing the sink, within N calls of each. For example, `handler` (source) calls `f1`, which calls `f2`, which calls `run_cmd` (sink): `handler` is 3 calls above `run_cmd`, so this flow needs a depth of at least 3. When the limit stops the search, the scan reports a warning (shown with `--verbose`). A rule can set its own limit with `options: { taint_interfile_depth: N }`, which takes precedence over the flag.
+
+**Deduplication.** By default, findings at the same sink are reported once. With `--interfile-dedup-by=source-sink`, each source that reaches the sink is reported separately.
+
+`--dataflow-traces` shows the cross-file path in text and SARIF output.
 
 ## Writing Custom Rules
 
@@ -263,6 +278,39 @@ rules:
 - **Sinks**: Where data becomes dangerous
 - **Sanitizers**: What makes data safe
 
+### Interfile Taint Rules
+
+An interfile rule is a taint rule with `taint_interfile: true` (see [Interfile (Cross-File) Tainting](#interfile-cross-file-tainting)):
+
+```yaml
+rules:
+  - id: python-request-to-os-system
+    languages: [python]
+    severity: ERROR
+    message: Request data reaches os.system
+    mode: taint
+    options:
+      taint_interfile: true
+    pattern-sources:
+      - pattern: request.args.get(...)
+    pattern-sanitizers:
+      - pattern: shlex.quote(...)
+    pattern-sinks:
+      - patterns:
+          - pattern: os.system($CMD)
+          - focus-metavariable: $CMD
+```
+
+With `handler()` in `views.py` passing `request.args.get("cmd")` to `run_cmd(c)` in `util.py`, which calls `os.system(c)`, the finding is reported at `os.system(c)` in `util.py`, with the source in `views.py`. A `shlex.quote(...)` call in a third file also stops the flow.
+
+**Use explicit sources, not function parameters.** Interfile analysis carries taint from each call into the parameters of the called function, so sources should be the expressions where untrusted data enters the program: request accessors, command-line arguments, environment variables, file and socket reads. A source that matches every function parameter (for example `def $F(..., $P, ...)` with `focus-metavariable: $P`) defeats this:
+
+- it reports sinks that no caller reaches with untrusted data, such as a helper called only with constant strings;
+- the trace ends at the parameter instead of showing where the data came from in another file;
+- every function becomes a starting point, so the analysis covers far more of the project.
+
+Sinks should likewise be specific calls, with `focus-metavariable` on the dangerous argument.
+
 ### YAML Pitfalls
 
 Patterns are YAML string values. Any pattern containing `: ` (colon-space) will be misinterpreted as a YAML mapping and cause a validation error. Always quote such patterns:
@@ -349,6 +397,15 @@ rules:
     # ... rest of rule
 ```
 
+Taint rule options:
+
+```yaml
+    options:
+      taint_intrafile: true        # Cross-function taint within a file
+      taint_interfile: true        # Cross-file taint (needs --enable-interfile)
+      taint_interfile_depth: 5     # Call depth limit for this rule, overrides --interfile-depth
+```
+
 Use `--allow-rule-timeout-control` to enable per-rule timeouts.
 
 ## Testing Rules
@@ -382,6 +439,22 @@ opengrep validate rule.yaml
 
 # Debug taint flow
 opengrep scan --dataflow-traces -f rule.yaml test_file.py
+```
+
+### Testing Interfile Rules
+
+Annotate the sink line in the file where the sink is, and pass every file of the flow in one run, with `--enable-interfile`:
+
+```bash
+opengrep test --enable-interfile --config rule.yaml views.py util.py
+```
+
+Without `--enable-interfile`, cross-file findings are not produced and the test reports them as missed lines.
+
+When an expected finding is missing, check that the call graph contains the calls in the flow:
+
+```bash
+opengrep show dump-interfile-graph python .
 ```
 
 ## Configuration
@@ -456,7 +529,7 @@ Note: Ruleset availability may differ from Semgrep registry.
 
 Opengrep is forked from Semgrep 1.100.0. Key differences:
 
-- **Semgrep Pro features, open**: Intrafile cross-function tainting (`--taint-intrafile`), higher-order function support, and inter-method taint flow -- all available without a commercial license
+- **Semgrep Pro features, open**: Intrafile cross-function tainting (`--taint-intrafile`), interfile cross-file tainting (`--enable-interfile`), higher-order function support, and inter-method taint flow -- all available without a commercial license
 - **Additional languages**: Visual Basic (not available in Semgrep CE or Pro), Apex, Elixir (not in Semgrep CE), improved Clojure with taint support
 - **Windows**: Native support
 - **Per-rule timeouts**: `timeout` and `dynamic_timeout` rule options
